@@ -1,1336 +1,805 @@
 #include "neuton.h"
-
 #include <stdlib.h>
-#include <string.h>
-#include <math.h>
+
+#include "preprocessing/blocks/normalize/normalize.h"
+
+#if (NEUTON_MODEL_FLOAT_SUPPORT == 1)
+	#include <math.h>
+#endif
 
 
-#if defined(NEUTON_USE_STDIO)
-#include <stdio.h>
+#define N_ELEMENTS(arr) (sizeof(arr) / sizeof(arr[0]))
+#define MAX_INPUT_FLOAT	0.9999999f
+
+#if (NEUTON_MODEL_HEADER_VERSION < 3)
+#define NEUTON_INPUTS_IS_INTEGER 0
+#endif
+
+
+static float modelOutput[NEUTON_MODEL_OUTPUTS_COUNT];
+static coeff_t modelAccumulators[NEUTON_MODEL_NEURONS_COUNT];
+static uint8_t modelIsReadyForInference = 0;
+
+#if (NEUTON_MODEL_QLEVEL < 32)
+static coeff_t ctMax = (1u << NEUTON_MODEL_QLEVEL) - 1;
+#endif
+
+#define NEUTON_MODEL_INPUT_TYPE_SIZE ((sizeof(input_t) > sizeof(coeff_t)) ? sizeof(input_t) : sizeof(coeff_t))
+
+#if (NEUTON_PREPROCESSING_ENABLED == 0)
+
+	static uint8_t modelInputBuffer[NEUTON_MODEL_INPUTS_COUNT * NEUTON_MODEL_INPUT_TYPE_SIZE] __attribute__ ((aligned));
+
 #else
-#define SEEK_SET	0	/* Seek from beginning of file.  */
-#define SEEK_CUR	1	/* Seek from current position.  */
-#define SEEK_END	2	/* Seek from end of file.  */
+
+	static uint8_t modelInputBuffer[NEUTON_MODEL_INPUTS_COUNT_ORIGINAL * NEUTON_MODEL_WINDOW_SIZE * NEUTON_MODEL_INPUT_TYPE_SIZE] __attribute__ ((aligned));
+	static uint16_t modelWindowFill = 0;
+
+	#ifndef NEUTON_MODEL_SA_PRECISION
+		#define NEUTON_MODEL_SA_PRECISION 24
+	#endif
+
+	#define SA_PRECISION NEUTON_MODEL_SA_PRECISION
+
+	#include "fe/statistical/Common.h"
+	#include "fe/statistical/DSP.h"
+
+	#define NEUTON_MODEL_EXTRACTED_FEATURES_TYPE_SIZE ((sizeof(extracted_feature_t) > sizeof(coeff_t)) ? sizeof(extracted_feature_t) : sizeof(coeff_t))
+	static uint8_t extractedFeaturesBuffer[EF_COUNT * NEUTON_MODEL_INPUTS_COUNT_ORIGINAL * NEUTON_MODEL_EXTRACTED_FEATURES_TYPE_SIZE] __attribute__ ((aligned));
+
 #endif
 
 
-#define MAX_INPUT_FLOAT			0.9999999f
-#define MAX_INPUT_DOUBLE		0.999999999999999
-
-#define KSHIFT_2				2
-#define KSHIFT_10				10
-
-
-#if !defined(NEUTON_Q32_SUPPORT)
-#define NEUTON_Q32_SUPPORT		1
-#endif
-#if !defined(NEUTON_Q16_SUPPORT)
-#define NEUTON_Q16_SUPPORT		1
-#endif
-
-
-#if defined(NEUTON_MEMORY_BENCHMARK)
-#if !defined(NEUTON_MEMORY_BENCHMARK_SIZE)
-#define NEUTON_MEMORY_BENCHMARK_SIZE 4
-#endif
-
-#include <stdio.h>
-
-
-typedef struct MemoryChunk_
+inline uint8_t neuton_model_quantization_level()
 {
-	void*    ptr;
-	uint32_t size;
-
+	return NEUTON_MODEL_QLEVEL;
 }
-MemoryChunk;
 
-
-static MemoryChunk chunks[NEUTON_MEMORY_BENCHMARK_SIZE] = { 0 };
-
-static uint32_t memAllocated = 0;
-static uint32_t memAllocatedMax = 0;
-static uint8_t  allocs = 0;
-static uint8_t  allocsMax = 0;
-
-extern uint32_t _NeutonExtraMemoryUsage();
-#endif
-
-
-static const uint8_t pointerTypeSize = sizeof(void*);
-
-
-/**
- * \brief File types
- */
-typedef enum FileType_
+inline uint8_t neuton_model_float_calculations()
 {
-	TYPE_UNKNOWN = 0,
-	TYPE_DATASET = 1,
-	TYPE_MODEL   = 5,
+	return NEUTON_MODEL_FLOAT_SUPPORT;
+}
 
-} FileType;
-
-/**
- * \brief Common header of binary files
- */
-typedef struct __attribute__((packed)) BinHeader_
+inline TaskType neuton_model_task_type()
 {
-	char     nb[2];
-	uint8_t  type;
-	uint8_t  version;
-	uint16_t bom;
+	return (TaskType) NEUTON_MODEL_TASK_TYPE;
+}
 
-} BinHeader;
-
-/**
- * \brief Header of meta file
- */
-typedef struct __attribute__((packed)) MetaInfo_
+inline uint16_t neuton_model_outputs_count()
 {
-	uint8_t  options;
-	uint8_t  taskType;
-	uint16_t inputsDim;
-	uint16_t outputsDim;
-	uint8_t  quantisation;
-	uint8_t  reserved;
-	uint16_t neuronsCount;
+	return NEUTON_MODEL_OUTPUTS_COUNT;
+}
 
-} MetaInfo;
-
-struct NFile_
+inline uint16_t neuton_model_neurons_count()
 {
-#if defined(NEUTON_USE_STDIO)
-	FILE* desc;
-#endif
+	return NEUTON_MODEL_NEURONS_COUNT;
+}
 
-	uint8_t* data;
-	uint32_t size;
-	uint32_t pos;
-};
-
-
-NFile *NFileOpen(const char *filename, const char *modes)
+inline uint32_t neuton_model_weights_count()
 {
-#if defined(NEUTON_USE_STDIO)
-	FILE* desc = fopen(filename, modes);
-	if (!desc)
-		return NULL;
+	return NEUTON_MODEL_WEIGHTS_COUNT;
+}
 
-	NFile* file = NAlloc(1, sizeof(struct NFile_));
-	if (!file)
-	{
-		fclose(desc);
-		return NULL;
-	}
+inline uint16_t neuton_model_inputs_limits_count()
+{
+	return NEUTON_MODEL_INPUT_LIMITS_COUNT;
+}
 
-	file->desc = desc;
+inline uint16_t neuton_model_inputs_count()
+{
+#if (NEUTON_PREPROCESSING_ENABLED == 0)
 
-	NFileSeek(file, 0, SEEK_END);
-	file->size = NFilePos(file);
-	NFileSeek(file, 0, SEEK_SET);
+	return NEUTON_MODEL_INPUTS_COUNT;
 
-	return file;
 #else
-	return NULL;
+
+	return NEUTON_MODEL_INPUTS_COUNT_ORIGINAL;
+
 #endif
 }
 
-
-NFile *NFileFromBuffer(const uint8_t* buffer, uint32_t size)
+inline uint16_t neuton_model_window_size()
 {
-	if (!buffer || !size)
-		return NULL;
+#if (NEUTON_PREPROCESSING_ENABLED == 1)
 
-	NFile* file = NAlloc(1, sizeof(struct NFile_));
-	if (!file)
-		return NULL;
+	return NEUTON_MODEL_WINDOW_SIZE;
 
-	file->data = (uint8_t*) buffer;
-	file->size = size;
-	file->pos = 0;
+#else
 
-	return file;
+	return 1;
+
+#endif
 }
 
-
-int32_t NFileClose(NFile *file)
+uint32_t neuton_model_ram_usage()
 {
-	int32_t res = 0;
+	return sizeof(modelOutput) + sizeof(modelAccumulators) + sizeof(modelIsReadyForInference)
+			+ sizeof(modelInputBuffer)
 
-	if (!file)
-		return res;
+#if (NEUTON_PREPROCESSING_ENABLED == 1)
 
-#if defined(NEUTON_USE_STDIO)
-	if (file->desc)
-		res = fclose(file->desc);
+			+ sizeof(extractedFeaturesBuffer)
+			+ sizeof(modelWindowFill)
+
+#endif
+#if (NEUTON_MODEL_QLEVEL < 32)
+			+ sizeof(ctMax)
+#endif
+			;
+}
+
+uint32_t neuton_model_size()
+{
+	return sizeof(modelWeights)	+ sizeof(modelLinks) + sizeof(modelFuncCoeffs)
+			+ sizeof(modelIntLinksBoundaries) + sizeof(modelExtLinksBoundaries)
+			+ sizeof(modelOutputNeurons)
+
+#if (NEUTON_MODEL_HEADER_VERSION > 1)
+
+			+ sizeof(modelFuncTypes)
+
+#endif
+			;
+}
+
+uint32_t neuton_model_size_with_meta()
+{
+	return neuton_model_size()
+
+#if (NEUTON_PREPROCESSING_ENABLED == 0)
+
+			+ sizeof(modelInputMin)	+ sizeof(modelInputMax)
+
+#endif
+#if (NEUTON_PREPROCESSING_ENABLED == 1)
+
+	#if (NEUTON_DROP_ORIGINAL_FEATURES != 1)
+			+ sizeof(modelInputScaleMin) + sizeof(modelInputScaleMax)
+	#endif
+			+ sizeof(extractedFeaturesScaleMin) + sizeof(extractedFeaturesScaleMax)
+
+#endif
+#if (NEUTON_BITMASK_ENABLED == 1)
+
+			+ sizeof(modelUsedInputsMask)
+
+#endif
+#if (NEUTON_MODEL_TASK_TYPE == 2)
+
+			+ sizeof(modelOutputMin) + sizeof(modelOutputMax)
+
+#endif
+#if (NEUTON_MODEL_LOG_SCALE_OUTPUTS == 1)
+
+			+ sizeof(modelOutputLogFlag) + sizeof(modelOutputLogScale)
+
+#endif
+			;
+}
+
+static void denormalize_outputs()
+{
+#if (NEUTON_MODEL_TASK_TYPE == 0) || (NEUTON_MODEL_TASK_TYPE == 1)
+
+	float sum = 0;
+
+	for (uint16_t i = 0; i < NEUTON_MODEL_OUTPUTS_COUNT; ++i)
+		sum += modelOutput[i];
+
+	for (uint16_t i = 0; i < NEUTON_MODEL_OUTPUTS_COUNT; ++i)
+		modelOutput[i] = (sum != 0) ? modelOutput[i] / sum: 0;
+
 #endif
 
-	memset(file, 0, sizeof(struct NFile_));
-	NFree(file);
+#if (NEUTON_MODEL_TASK_TYPE == 2)
 
-	return res;
-}
+	for (uint16_t i = 0; i < NEUTON_MODEL_OUTPUTS_COUNT; ++i)
+	{
+		modelOutput[i] = modelOutput[i] * (modelOutputMax[i] - modelOutputMin[i]) + modelOutputMin[i];
 
+#if (NEUTON_MODEL_LOG_SCALE_OUTPUTS == 1)
 
-int32_t NFileSeek(NFile *file, int64_t offset, int32_t whence)
-{
-#if defined(NEUTON_USE_STDIO)
-	if (file->desc)
-		return fseek(file->desc, offset, whence);
+		if (modelOutputLogFlag[i])
+			modelOutput[i] = exp(modelOutput[i]) - modelOutputLogScale[i];
+
 #endif
 
-	int32_t res = -1;
-	int64_t newPos = -1;
-
-	switch (whence)
-	{
-	case SEEK_SET:
-		newPos = offset;
-		break;
-
-	case SEEK_CUR:
-		newPos = (int64_t) file->pos + offset;
-		break;
-
-	case SEEK_END:
-		newPos = (int64_t) file->size + offset;
-		break;
-
-	default:;
 	}
-
-	if (newPos >= 0 && newPos <= file->size)
-	{
-		file->pos = newPos;
-		res = 0;
-	}
-
-	return res;
+#endif
 }
 
-
-int64_t NFilePos(NFile *file)
+void neuton_model_reset_inputs()
 {
-#if defined(NEUTON_USE_STDIO)
-	if (file->desc)
-		return ftell(file->desc);
+#if (NEUTON_PREPROCESSING_ENABLED != 0)
+
+	modelWindowFill = 0;
+
 #endif
 
-	return file->size ? (int64_t)file->pos : -1;
+	modelIsReadyForInference = 0;
 }
 
-
-uint32_t NFileRead(void *data, uint32_t size, uint32_t count, NFile *file)
+int8_t neuton_model_set_inputs(input_t *inputs)
 {
-#if defined(NEUTON_USE_STDIO)
-	if (file->desc)
-		return fread(data, size, count, file->desc);
+	if (!inputs)
+		return -1;
+
+	input_t* buffer = (input_t*)modelInputBuffer;
+
+#if (NEUTON_PREPROCESSING_ENABLED == 0)
+
+	for (uint16_t i = 0; i < neuton_model_inputs_count(); ++i)
+		buffer[i] = inputs[i];
+
+	modelIsReadyForInference = 1;
+
+	return 0;
+
+#else
+
+	for (uint16_t i = 0; i < NEUTON_MODEL_INPUTS_COUNT_ORIGINAL; ++i)
+		buffer[i * NEUTON_MODEL_WINDOW_SIZE + modelWindowFill] = inputs[i];
+
+	if (++modelWindowFill >= NEUTON_MODEL_WINDOW_SIZE)
+	{
+		modelWindowFill = 0;
+		modelIsReadyForInference = 1;
+
+		return 0;
+	}
+
+	return 1;
+
 #endif
-
-	uint32_t res = count;
-	if (file->pos + size * count > file->size)
-		res = (file->size - file->pos) / size;
-
-	if (res > 0)
-	{
-		count = res * size;
-		memcpy(data, file->data + file->pos, res * size);
-		file->pos += count;
-	}
-
-	return res;
 }
 
+#if (NEUTON_MODEL_QLEVEL == 32)
 
-/**
- * \brief Get data associated with file
- * \param file - file descriptor
- * \return pointer to data or 0 if file not associated with buffer
- */
-static inline void* NFileData(NFile* file)
+static inline coeff_t neuton_activation_fn(neurons_size_t neuronIndex, acc_signed_t summ)
 {
-	return (file && file->data) ? file->data : NULL;
+	return 1.0f / (1.0f + exp((acc_signed_t) ((acc_signed_t) -modelFuncCoeffs[neuronIndex]) * summ));
 }
 
+#else // (NEUTON_MODEL_QLEVEL == 32)
 
-/**
- * \brief Get file size
- * \param file - file descriptor
- * \return file size
- */
-static inline uint32_t NFileSize(NFile* file)
-{
-	return file->size;
-}
+#if (NEUTON_MODEL_FLOAT_SUPPORT == 0)
 
-
-static uint32_t crc32c(uint32_t crc, const uint8_t* buffer, size_t size)
-{
-	static const uint32_t POLY = 0xedb88320;
-	uint32_t k;
-
-	crc = ~crc;
-
-	while (size--)
+	static coeff_t accurate_fast_sigmoid(acc_signed_t arg)
 	{
-		crc ^= *buffer++;
-		for (k = 0; k < 8; k++)
-			crc = crc & 1 ? (crc >> 1) ^ POLY : crc >> 1;
-	}
+		coeff_t qResult = 0;
+		coeff_t secondPointY = 0;
+		coeff_t firstPointY = 0;
 
-	return ~crc;
-}
+		static const uint8_t QLVL = NEUTON_MODEL_QLEVEL;
+		static const acc_signed_t CT_MAX_VALUE = 1u << QLVL;
+		const acc_signed_t intPart = abs(arg) / (1u << QLVL);
+		const acc_signed_t realPart = abs(arg) - (intPart << QLVL);
 
-
-static void Reverse2BytesValuesBuffer(void* buf, uint32_t valuesCount)
-{
-	uint16_t* n = buf;
-	uint32_t i;
-
-	for (i = 0; i < valuesCount; ++i)
-	{
-		*n = (*n & 0x00FF) << 8 | (*n & 0xFF00) >> 8;
-		++n;
-	}
-}
-
-
-static void Reverse4BytesValuesBuffer(void* buf, uint32_t valuesCount)
-{
-	uint32_t* n = buf;
-	uint32_t i;
-
-	for (i = 0; i < valuesCount; ++i)
-	{
-		*n = (*n & 0x000000FFu) << 24 | (*n & 0x0000FF00u) << 8 |
-			 (*n & 0x00FF0000u) >> 8 | (*n & 0xFF000000u) >> 24;
-		++n;
-	}
-}
-
-
-/**
- * \brief Check file header on correct format
- * \param file - descriptor of the file
- * \param reverseByteOrder - output parameter; flag of the need to reverse
- *        byte order for correct data reading
- */
-static Err CheckFileHeader(NFile *file, uint8_t* reverseByteOrder, uint8_t type)
-{
-	BinHeader header;
-	const uint32_t oneElement = 1;
-
-	if (NFileSeek(file, 0, SEEK_SET) != 0)
-		return ERR_READ_FILE;
-
-	if (NFileRead(&header, sizeof(header), oneElement, file) != oneElement)
-		return ERR_READ_FILE;
-
-	if (!(header.nb[0] == 'n' && header.nb[1] == 'b'))
-		return ERR_BAD_FILE_FORMAT;
-
-	if (header.type != type)
-		return ERR_BAD_FILE_FORMAT;
-
-	const uint16_t BOM_PATTERN = 0xABCD;
-
-	if (header.bom == BOM_PATTERN)
-	{
-		*reverseByteOrder = 0;
-	}
-	else
-	{
-		if (((header.bom & 0x00FF) << 8 | (header.bom & 0xFF00) >> 8) == BOM_PATTERN)
+		if (intPart == 0 && realPart == 0)
 		{
-			*reverseByteOrder = 1;
-		}
-		else
-		{
-			return ERR_BAD_FILE_FORMAT;
-		}
-	}
-
-	Err err = ERR_NO_ERROR;
-
-	if (type == TYPE_MODEL)
-	{
-		if (NFileSeek(file, 0, SEEK_SET) != 0)
-			return ERR_READ_FILE;
-
-		uint32_t crcActual = 0;
-		uint32_t pos;
-		for (pos = 0; pos < NFileSize(file) - sizeof(crcActual); ++pos)
-		{
-			uint8_t byte;
-			if (NFileRead(&byte, sizeof(byte), oneElement, file) != oneElement)
-				return ERR_READ_FILE;
-
-			crcActual = crc32c(crcActual, &byte, sizeof(byte));
+			return 1u << (QLVL - 1);
 		}
 
-		uint32_t crcFromFile = 0;
-		if (NFileRead(&crcFromFile, sizeof(crcFromFile), oneElement, file) != oneElement)
-			return ERR_BAD_FILE_FORMAT;
-
-		if (*reverseByteOrder)
-			Reverse4BytesValuesBuffer(&crcFromFile, oneElement);
-
-		if (NFileSeek(file, sizeof(header), SEEK_SET) != 0)
-			return ERR_READ_FILE;
-
-		err = (crcActual == crcFromFile) ? ERR_NO_ERROR : ERR_INCONSISTENT_DATA;
-	}
-
-	return err;
-}
-
-#if 0
-static void Reverse8BytesValuesBuffer(void* buf, uint32_t valuesCount)
-{
-	uint64_t* n = buf;
-	uint32_t i;
-
-	for (i = 0; i < valuesCount; ++i)
-	{
-		Reverse4BytesValuesBuffer(n, 2);
-		*n = (*n & 0x00000000FFFFFFFFull) << 32 | (*n & 0xFFFFFFFF00000000ull) >> 32;
-		++n;
-	}
-}
-#endif
-
-
-static inline uint32_t AlignBy(uint8_t align, size_t value)
-{
-	return (value % align == 0) ? 0 : align - (value % align);
-}
-
-
-Err NLoadModel(NFile *file, NeuralNet *model, uint8_t copy)
-{
-	Err err = ERR_NO_ERROR;
-
-	if (!file)
-		return ERR_OPEN_FILE;
-	if (!model)
-		return ERR_BAD_ARGUMENT;
-
-
-	void* data = model->data;
-	NFreeModel(model);
-	model->data = data;
-
-
-	if (CheckFileHeader(file, &model->reverseByteOrder, TYPE_MODEL) != ERR_NO_ERROR)
-		return ERR_BAD_FILE_FORMAT;
-
-
-	const uint8_t oneElement = 1;
-
-
-	MetaInfo metaInfo = { 0 };
-	if (NFileRead(&metaInfo, sizeof(metaInfo), oneElement, file) != oneElement)
-		return ERR_READ_FILE;
-
-	uint32_t weightsDim = 0;
-	if (NFileRead(&weightsDim, sizeof(weightsDim), oneElement, file) != oneElement)
-		return ERR_READ_FILE;
-
-	if (!(metaInfo.quantisation == 8
-#if (NEUTON_Q16_SUPPORT == 1)
-		  || metaInfo.quantisation == 16
-#endif
-#if (NEUTON_Q32_SUPPORT == 1)
-		  || metaInfo.quantisation == 32
-#endif
-	))
-		return ERR_FEATURE_NOT_SUPPORTED;
-
-	if (!weightsDim || !metaInfo.inputsDim || !metaInfo.outputsDim || !metaInfo.neuronsCount)
-		return ERR_INCONSISTENT_DATA;
-
-	if (model->reverseByteOrder)
-	{
-		Reverse2BytesValuesBuffer(&metaInfo.inputsDim,    oneElement);
-		Reverse2BytesValuesBuffer(&metaInfo.outputsDim,   oneElement);
-		Reverse2BytesValuesBuffer(&metaInfo.neuronsCount, oneElement);
-		Reverse4BytesValuesBuffer(&weightsDim,            oneElement);
-	}
-
-	model->options              = metaInfo.options;
-	model->taskType             = metaInfo.taskType;
-	model->inputsDim            = metaInfo.inputsDim;
-	model->outputsDim           = metaInfo.outputsDim;
-	model->quantisation         = metaInfo.quantisation;
-
-	model->neuronsCount         = metaInfo.neuronsCount;
-	model->weightDim            = weightsDim;
-
-	const uint8_t align            = model->quantisation / 8;
-	const uint8_t positionTypeSize = sizeof(*model->links);
-	const uint8_t offsetTypeSize   = model->weightDim <= 256 ? 1 : model->weightDim <= 65536 ? 2 : 4;
-	const uint8_t limitTypeSize    = sizeof(*model->inputsMin);
-	const uint8_t coeffTypeSize    = (model->quantisation == 32) ? 4 : model->quantisation == 16 ? 2 : 1;
-	const uint8_t accTypeSize      = coeffTypeSize;
-
-	if (!positionTypeSize || !coeffTypeSize || !limitTypeSize || !pointerTypeSize || !align)
-		return ERR_MEMORY_ALLOCATION;
-
-	uint16_t inputLimitsCount =
-			(model->options & BIT_ONE_MAXMIN_FOR_ALL_INPUTS) > 0 ? oneElement : model->inputsDim;
-
-	uint8_t hasLogScale = (model->options & BIT_LOG_SCALE_OUT_EXISTS) > 0;
-
-
-	// This part can be mapped
-	uint32_t blockSize =
-		2           * limitTypeSize * inputLimitsCount +  // input limits
-		2           * limitTypeSize * model->outputsDim + // output limits
-		hasLogScale * limitTypeSize * model->outputsDim;  // output log scale
-
-	blockSize +=
-		AlignBy(align, blockSize) +
-		model->outputsDim * positionTypeSize;             // output neuron indexes
-	blockSize +=
-		AlignBy(align, blockSize) +
-		2 * model->neuronsCount * positionTypeSize;       // int/ext links count
-	blockSize +=
-		AlignBy(align, blockSize) +
-		model->weightDim * positionTypeSize;              // model links
-	blockSize +=
-		AlignBy(align, blockSize) +
-		model->weightDim * coeffTypeSize;                 // model weights
-	blockSize +=
-		AlignBy(align, blockSize) +
-		model->neuronsCount * coeffTypeSize;              // activation function coefficients
-
-
-	uint8_t useMapper = !copy && (model->reverseByteOrder == 0) && NFileData(file) &&
-						(NFileSize(file) >= (blockSize + NFilePos(file)));
-	if (useMapper)
-		blockSize = 0;
-
-	// This part always in RAM
-	const uint8_t memAlign = pointerTypeSize;
-
-	blockSize +=
-		AlignBy(memAlign, blockSize) +
-		model->outputsDim * limitTypeSize;                // output buffer
-
-	blockSize +=
-		AlignBy(memAlign, blockSize) +
-		model->neuronsCount * accTypeSize;                // accumulators
-
-	blockSize +=
-		AlignBy(memAlign, blockSize) +
-		2 * model->neuronsCount * offsetTypeSize;         // int/ext model links
-
-
-	uint8_t* block = model->memoryBlock = NAlloc(oneElement, blockSize);
-	if (block == NULL)
-		return ERR_MEMORY_ALLOCATION;
-
-
-	// This part can be mapped
-	if (useMapper)
-		block = (uint8_t*) NFileData(file) + NFilePos(file);
-
-	model->inputsMax  = (void*) block; block += limitTypeSize * inputLimitsCount;
-	model->inputsMin  = (void*) block; block += limitTypeSize * inputLimitsCount;
-	model->outputsMax = (void*) block; block += limitTypeSize * model->outputsDim;
-	model->outputsMin = (void*) block; block += limitTypeSize * model->outputsDim;
-
-	model->outputsLogOffset = hasLogScale ? (void*) block : NULL;
-	block += hasLogScale * limitTypeSize * model->outputsDim;
-
-	block += AlignBy(align, (size_t) block);
-	model->outputLabels = (void*) block; block += positionTypeSize * model->outputsDim;
-
-	block += AlignBy(align, (size_t) block);
-	model->intLinksCounters = (void*) block; block += positionTypeSize * model->neuronsCount;
-	model->extLinksCounters = (void*) block; block += positionTypeSize * model->neuronsCount;
-
-	uint32_t structureSize = positionTypeSize * model->weightDim;
-	uint32_t structureOffset = structureSize += AlignBy(align, structureSize);
-	structureSize += coeffTypeSize * model->weightDim;
-
-	block += AlignBy(align, (size_t) block);
-	void* structure = model->links = (void*) block; block += structureSize;
-	model->weights.raw = (void*) ((uint8_t*) structure + structureOffset);
-
-	block += AlignBy(align, (size_t) block);
-	model->fncCoeffs.raw = block; block += coeffTypeSize * model->neuronsCount;
-
-
-	// This part always in RAM
-	if (useMapper)
-		block = model->memoryBlock;
-
-	block += AlignBy(memAlign, (size_t) block);
-	model->outputBuffer = (void*) block; block += limitTypeSize * model->outputsDim;
-
-	block += AlignBy(memAlign, (size_t) block);
-	model->accumulators.raw = (void*) block; block += accTypeSize * model->neuronsCount;
-
-	block += AlignBy(memAlign, (size_t) block);
-	model->intLinks.u8 = block; block += offsetTypeSize * model->neuronsCount;
-	model->extLinks.u8 = block; block += offsetTypeSize * model->neuronsCount;
-
-	if (!useMapper)
-	{
-		if (NFileRead(model->inputsMax,  limitTypeSize, inputLimitsCount, file) != inputLimitsCount ||
-			NFileRead(model->inputsMin,  limitTypeSize, inputLimitsCount, file) != inputLimitsCount ||
-			NFileRead(model->outputsMax, limitTypeSize, model->outputsDim, file) != model->outputsDim ||
-			NFileRead(model->outputsMin, limitTypeSize, model->outputsDim, file) != model->outputsDim)
-			return ERR_READ_FILE;
-
-		if (hasLogScale &&
-			NFileRead(model->outputsLogOffset, limitTypeSize, model->outputsDim, file) != model->outputsDim)
-			return ERR_READ_FILE;
-
-		if (NFileSeek(file, AlignBy(align, NFilePos(file)), SEEK_CUR) == 0 &&
-			NFileRead(model->outputLabels, positionTypeSize, model->outputsDim, file) != model->outputsDim)
-			return ERR_READ_FILE;
-
-		if (NFileSeek(file, AlignBy(align, NFilePos(file)), SEEK_CUR) == 0 &&
-			(NFileRead(model->intLinksCounters, positionTypeSize, model->neuronsCount, file) != model->neuronsCount ||
-			NFileRead(model->extLinksCounters, positionTypeSize, model->neuronsCount, file) != model->neuronsCount))
-			return ERR_READ_FILE;
-
-		if (NFileSeek(file, AlignBy(align, NFilePos(file)), SEEK_CUR) == 0 &&
-			NFileRead(structure, structureSize, oneElement, file) != oneElement)
-			return ERR_READ_FILE;
-
-		if (NFileSeek(file, AlignBy(align, NFilePos(file)), SEEK_CUR) == 0 &&
-			NFileRead(model->fncCoeffs.raw,   coeffTypeSize, model->neuronsCount, file) != model->neuronsCount)
-			return ERR_READ_FILE;
-
-		if (model->reverseByteOrder)
+		int s = arg > 0 ? 0 : 1;
+		if (realPart == 0)
 		{
-			switch (limitTypeSize)
+			for (int i = 0; i < QLVL; i++)
 			{
-			case 4:
-				Reverse4BytesValuesBuffer(model->inputsMax,  inputLimitsCount);
-				Reverse4BytesValuesBuffer(model->inputsMin,  inputLimitsCount);
-				Reverse4BytesValuesBuffer(model->outputsMax, model->outputsDim);
-				Reverse4BytesValuesBuffer(model->outputsMin, model->outputsDim);
-				if (hasLogScale)
-					Reverse4BytesValuesBuffer(model->outputsLogOffset, model->outputsDim);
-				break;
-
-			default:
-				return ERR_FEATURE_NOT_SUPPORTED;
-				break;
+				const uint8_t bit = ((i / intPart + s) % 2);
+				qResult = qResult | (bit << (QLVL - i - 1));
 			}
+			return qResult;
+		}
 
-			switch (positionTypeSize)
+		const acc_signed_t secondPointX = intPart + 1;
+		if (intPart == 0)
+		{
+			firstPointY = 1u << (QLVL - 1);
+			for (int i = 0; i < QLVL; i++)
 			{
-			case 1:
-				break;
-
-			case 2:
-				Reverse2BytesValuesBuffer(model->intLinksCounters, model->neuronsCount);
-				Reverse2BytesValuesBuffer(model->extLinksCounters, model->neuronsCount);
-				Reverse2BytesValuesBuffer(structure,               model->weightDim);
-				Reverse2BytesValuesBuffer(model->outputLabels,     model->outputsDim);
-				break;
-
-			case 4:
-				Reverse4BytesValuesBuffer(model->intLinksCounters, model->neuronsCount);
-				Reverse4BytesValuesBuffer(model->extLinksCounters, model->neuronsCount);
-				Reverse4BytesValuesBuffer(structure,               model->weightDim);
-				Reverse4BytesValuesBuffer(model->outputLabels,     model->outputsDim);
-				break;
-
-			default:
-				return ERR_FEATURE_NOT_SUPPORTED;
-				break;
-			}
-
-			switch (coeffTypeSize)
-			{
-			case 1:
-				break;
-
-			case 2:
-				Reverse2BytesValuesBuffer((uint8_t*) structure + structureOffset, model->weightDim);
-				Reverse2BytesValuesBuffer(model->fncCoeffs.raw,                   model->neuronsCount);
-				break;
-
-			case 4:
-				Reverse4BytesValuesBuffer((uint8_t*) structure + structureOffset, model->weightDim);
-				Reverse4BytesValuesBuffer(model->fncCoeffs.raw,                   model->neuronsCount);
-				break;
-
-			default:
-				return ERR_FEATURE_NOT_SUPPORTED;
-				break;
-			}
-
-		}
-	}
-
-
-	uint32_t offset = 0;
-	uint32_t idx;
-	for (idx = 0; idx < model->neuronsCount; offset += model->intLinksCounters[idx++])
-	{
-		switch (offsetTypeSize)
-		{
-		case 4:	 model->intLinks.u32[idx] = offset; break;
-		case 2:	 model->intLinks.u16[idx] = offset; break;
-		case 1:	 model->intLinks.u8[idx]  = offset; break;
-		default: return ERR_FEATURE_NOT_SUPPORTED;
-		}
-	}
-
-	for (idx = 0; idx < model->neuronsCount; offset += model->extLinksCounters[idx++])
-	{
-		switch (offsetTypeSize)
-		{
-		case 4:	 model->extLinks.u32[idx] = offset; break;
-		case 2:	 model->extLinks.u16[idx] = offset; break;
-		case 1:	 model->extLinks.u8[idx]  = offset; break;
-		default: return ERR_FEATURE_NOT_SUPPORTED;
-		}
-	}
-
-
-	for (idx = 0; idx < model->outputsDim; idx++)
-	{
-		if (model->outputLabels[idx] >= model->neuronsCount)
-			return ERR_INCONSISTENT_DATA;
-
-		if (model->outputsMin[idx] > model->outputsMax[idx])
-			return ERR_INCONSISTENT_DATA;
-	}
-
-	for (idx = 0; idx < inputLimitsCount; idx++)
-	{
-		if (model->inputsMin[idx] > model->inputsMax[idx])
-			return ERR_INCONSISTENT_DATA;
-	}
-
-	if ((inputLimitsCount == oneElement) && (model->inputsMax[0] != model->inputsMin[0]))
-		model->cachedInputsDiff = model->inputsMax[0] - model->inputsMin[0];
-
-
-	NFileClose(file);
-
-
-	return err;
-}
-
-
-Err NLoadModelEx(const char* fileName, NeuralNet* model)
-{
-	return NLoadModel(NFileOpen(fileName, "rb"), model, 1);
-}
-
-
-void NFreeModel(NeuralNet* model)
-{
-	if (model)
-	{
-		if (model->memoryBlock)
-			NFree(model->memoryBlock);
-
-		memset(model, 0, sizeof(*model));
-	}
-}
-
-
-void NNormalizeSample(float* sample, NeuralNet* model)
-{
-	uint16_t i;
-	uint16_t inputLimitsCount =
-			(model->options & BIT_ONE_MAXMIN_FOR_ALL_INPUTS) > 0
-			? 1 : model->inputsDim;
-
-	for (i = 0; i < model->inputsDim - 1; ++i)
-	{
-		if (inputLimitsCount == 1)
-		{
-			if (model->cachedInputsDiff)
-			{
-				sample[i] = (sample[i] - model->inputsMin[0]) / model->cachedInputsDiff;
-			}
-			else if (model->inputsMax[0] != model->inputsMin[0])
-			{
-				sample[i] = (sample[i] - model->inputsMin[0]) /
-						(model->inputsMax[0] - model->inputsMin[0]);
-			}
-
-		}
-		else if (model->inputsMax[i] != model->inputsMin[i])
-		{
-			sample[i] = (sample[i] - model->inputsMin[i]) /
-					(model->inputsMax[i] - model->inputsMin[i]);
-		}
-
-		if (sample[i] > 1.0f)
-			sample[i] = 1.0f;
-
-		if (sample[i] < 0.0f)
-			sample[i] = 0.0f;
-	}
-}
-
-
-void NDenormalizeResult(float* result, NeuralNet* model)
-{
-	uint16_t i;
-	if (model->taskType == TASK_BINARY_CLASSIFICATION)
-	{
-		float sum = 0;
-
-		for (i = 0; i < model->outputsDim; ++i)
-			sum += (float) result[i];
-
-		for (i = 0; i < model->outputsDim; ++i)
-			result[i] = (float) result[i] / sum;
-	}
-
-	if (model->taskType == TASK_MULTICLASS_CLASSIFICATION || model->taskType == TASK_REGRESSION)
-	{
-		uint8_t hasLogScale = (model->options & BIT_LOG_SCALE_OUT_EXISTS) > 0;
-
-		for (i = 0; i < model->outputsDim; ++i)
-		{
-			result[i] = result[i] * (model->outputsMax[i] - model->outputsMin[i]) +
-					model->outputsMin[i];
-
-			if (hasLogScale && (model->outputsLogOffset[i] != 0xFFFFFFFF))
-			{
-				result[i] = exp(result[i]) - model->outputsLogOffset[i];
-			}
-		}
-	}
-}
-
-
-static inline uint32_t valueAt(uint32_t index, Pointer p, uint8_t typeSize)
-{
-	switch (typeSize)
-	{
-	case sizeof(uint8_t):  return p.u8[index];
-	case sizeof(uint16_t): return p.u16[index];
-	case sizeof(uint32_t): return p.u32[index];
-	default:               return 0;
-	}
-}
-
-
-static uint8_t accurate_fast_sigmoid_u8(int32_t arg)
-{
-	uint8_t qResult = 0;
-	uint8_t secondPointY = 0;
-	uint8_t firstPointY = 0;
-
-	const uint8_t QLVL = 8;
-	const int32_t CT_MAX_VALUE = 1u << QLVL;
-	const int32_t intPart = abs(arg) / (2u << (QLVL - 1));
-	const int32_t realPart = abs(arg) - (intPart << QLVL);
-
-	int i;
-
-	if (intPart == 0 && realPart == 0)
-	{
-		return ldexp(0.5, QLVL);
-	}
-
-	int s = arg > 0 ? 0 : 1;
-	if (realPart == 0)
-	{
-		for (i = 0; i < QLVL; i++)
-		{
-			const uint8_t bit = ((i / intPart + s) % 2);
-			qResult = qResult | (bit << (QLVL - i - 1));
-		}
-		return qResult;
-	}
-
-	const int32_t secondPointX = intPart + 1;
-	if (intPart == 0)
-	{
-		firstPointY = ldexp(0.5, QLVL);
-		for (i = 0; i < QLVL; i++)
-		{
-			const uint8_t bit = ((i / secondPointX) % 2);
-			secondPointY = secondPointY | (bit << (QLVL - i - 1));
-		}
-	}
-	else
-	{
-		if (secondPointX == 0)
-		{
-			for (i = 0; i < QLVL; i++)
-			{
-				const uint8_t bit = ((i / intPart) % 2);
-				firstPointY = firstPointY | (bit << (QLVL - i - 1));
-			}
-			secondPointY = ldexp(0.5, QLVL);
-		}
-		else
-		{
-			for (i = 0; i < QLVL; i++)
-			{
-				uint8_t bit = ((i / intPart) % 2);
-				firstPointY = firstPointY | (bit << (QLVL - i - 1));
-				bit = ((i / secondPointX) % 2);
+				const uint8_t bit = ((i / secondPointX) % 2);
 				secondPointY = secondPointY | (bit << (QLVL - i - 1));
 			}
 		}
-	}
-
-	const int32_t res = (CT_MAX_VALUE - realPart) * firstPointY + realPart * secondPointY;
-	if (arg > 0)
-	{
-		return res >> QLVL;
-	}
-	else
-	{
-		qResult = res >> QLVL;
-		return qResult == 0 ? CT_MAX_VALUE - 1 : CT_MAX_VALUE - qResult;
-	}
-}
-
-#if (NEUTON_Q16_SUPPORT == 1)
-static uint16_t accurate_fast_sigmoid_u16(int64_t arg)
-{
-	uint16_t qResult = 0;
-	uint16_t secondPointY = 0;
-	uint16_t firstPointY = 0;
-
-	const uint8_t QLVL = 16;
-	const int64_t CT_MAX_VALUE = 1ul << QLVL;
-	const int64_t intPart = labs(arg) / (2ul << (QLVL - 1));
-	const int64_t realPart = labs(arg) - (intPart << QLVL);
-
-	int i;
-
-	if (intPart == 0 && realPart == 0)
-	{
-		return ldexp(0.5, QLVL);
-	}
-
-	int s = arg > 0 ? 0 : 1;
-	if (realPart == 0)
-	{
-		for (i = 0; i < QLVL; i++)
-		{
-			const uint8_t bit = ((i / intPart + s) % 2);
-			qResult = qResult | (bit << (QLVL - i - 1));
-		}
-		return qResult;
-	}
-
-	const int64_t secondPointX = intPart + 1;
-	if (intPart == 0)
-	{
-		firstPointY = ldexp(0.5, QLVL);
-		for (i = 0; i < QLVL; i++)
-		{
-			const uint8_t bit = ((i / secondPointX) % 2);
-			secondPointY = secondPointY | (bit << (QLVL - i - 1));
-		}
-	}
-	else
-	{
-		if (secondPointX == 0)
-		{
-			for (i = 0; i < QLVL; i++)
-			{
-				const uint8_t bit = ((i / intPart) % 2);
-				firstPointY = firstPointY | (bit << (QLVL - i - 1));
-			}
-			secondPointY = ldexp(0.5, QLVL);
-		}
 		else
 		{
-			for (i = 0; i < QLVL; i++)
+			if (secondPointX == 0)
 			{
-				uint8_t bit = ((i / intPart) % 2);
-				firstPointY = firstPointY | (bit << (QLVL - i - 1));
-				bit = ((i / secondPointX) % 2);
-				secondPointY = secondPointY | (bit << (QLVL - i - 1));
+				for (int i = 0; i < QLVL; i++)
+				{
+					const uint8_t bit = ((i / intPart) % 2);
+					firstPointY = firstPointY | (bit << (QLVL - i - 1));
+				}
+				secondPointY = 1u << (QLVL - 1);
+			}
+			else
+			{
+				for (int i = 0; i < QLVL; i++)
+				{
+					uint8_t bit = ((i / intPart) % 2);
+					firstPointY = firstPointY | (bit << (QLVL - i - 1));
+					bit = ((i / secondPointX) % 2);
+					secondPointY = secondPointY | (bit << (QLVL - i - 1));
+				}
 			}
 		}
+
+		const acc_signed_t res = (CT_MAX_VALUE - realPart) * firstPointY + realPart * secondPointY;
+		if (arg > 0)
+		{
+			return res >> QLVL;
+		}
+		else
+		{
+			qResult = res >> QLVL;
+			return qResult == 0 ? CT_MAX_VALUE - 1 : CT_MAX_VALUE - qResult;
+		}
 	}
 
-	const int64_t res = (CT_MAX_VALUE - realPart) * firstPointY + realPart * secondPointY;
-	if (arg > 0)
+#endif // (NEUTON_MODEL_FLOAT_SUPPORT == 0)
+
+static inline float neuton_deqantize_value(coeff_t value)
+{
+	return (float) value / (float) (1u << NEUTON_MODEL_QLEVEL);
+}
+
+#if (NEUTON_MODEL_QLEVEL == 8)
+	#define KSHIFT 2
+#endif
+
+#if (NEUTON_MODEL_QLEVEL == 16)
+	#define KSHIFT 10
+#endif
+
+static coeff_t neuton_activation_fn(neurons_size_t neuronIndex, acc_signed_t summ)
+{
+
+#if (NEUTON_MODEL_FLOAT_SUPPORT == 1)
+
+	const float qs = (float) (((acc_signed_t) modelFuncCoeffs[neuronIndex] * summ)
+			>> (NEUTON_MODEL_QLEVEL + KSHIFT - 1)) / (float) (1u << (NEUTON_MODEL_QLEVEL));
+
+	const float tmpValue = 1.0f / (1.0f + expf(-qs));
+
+	return (tmpValue > MAX_INPUT_FLOAT ? MAX_INPUT_FLOAT : tmpValue) * (float) (1u << NEUTON_MODEL_QLEVEL);
+
+#else // (NEUTON_MODEL_FLOAT_SUPPORT == 1)
+
+	return accurate_fast_sigmoid(
+		-(((acc_signed_t) modelFuncCoeffs[neuronIndex] * summ) >> (NEUTON_MODEL_QLEVEL + KSHIFT - 1))
+	);
+
+#endif // (NEUTON_MODEL_FLOAT_SUPPORT == 1)
+
+}
+#endif // (NEUTON_MODEL_QLEVEL == 32)
+
+
+#if (NEUTON_BITMASK_ENABLED == 1)
+static inline uint8_t is_input_used(uint32_t pos)
+{
+	return (modelUsedInputsMask[pos / 8] & (1u << (pos % 8)));
+}
+#endif
+
+#if (NEUTON_DROP_ORIGINAL_FEATURES != 1)
+
+static coeff_t prepare_model_input(input_t value, uint16_t index)
+{
+	input_t min, max;
+
+#if (NEUTON_PREPROCESSING_ENABLED == 1)
+
+	min = modelInputScaleMin[index / NEUTON_MODEL_WINDOW_SIZE];
+	max = modelInputScaleMax[index / NEUTON_MODEL_WINDOW_SIZE];
+
+#else
+
+	#if (NEUTON_MODEL_INPUT_LIMITS_COUNT == 1)
+
+		min = modelInputMin[0];
+		max = modelInputMax[0];
+
+	#else
+
+		min = modelInputMin[index];
+		max = modelInputMax[index];
+
+	#endif
+
+#endif
+
+#if (NEUTON_MODEL_QLEVEL == 32)
+
+	coeff_t ct = value;
+	neuton_preprocessing_block_normalize(&ct, &ct, 1, min, max);
+	return ct;
+
+#else
+
+	if (value < min)
+		value = min;
+	if (value > max)
+		value = max;
+
+	#if (NEUTON_INPUTS_IS_INTEGER == 1)
+
+		uint64_t tmp = value - min;
+
+		if ((max - min) == 0)
+		{
+			return tmp * ctMax;
+		}
+		else
+		{
+			return tmp * ctMax / (max - min);
+		}
+
+	#else
+
+		if ((max - min) == 0)
+		{
+			return (value - min) * ctMax;
+		}
+		else
+		{
+			return (value - min) * ctMax / (max - min);
+		}
+
+	#endif
+
+#endif
+}
+
+static void prepare_model_inputs()
+{
+	input_t* src = (input_t*)modelInputBuffer;
+	coeff_t* dst = (coeff_t*)modelInputBuffer;
+
+#if (NEUTON_PREPROCESSING_ENABLED == 0)
+	uint16_t count = NEUTON_MODEL_INPUTS_COUNT;
+#else
+	uint16_t count = NEUTON_MODEL_INPUTS_COUNT_ORIGINAL * NEUTON_MODEL_WINDOW_SIZE;
+#endif
+
+	if (sizeof(coeff_t) > sizeof(input_t))
 	{
-		return res >> QLVL;
+		for (uint16_t i = count-1; ; --i)
+		{
+		#if (NEUTON_BITMASK_ENABLED == 1)
+			if (is_input_used(i))
+		#endif
+				dst[i] = prepare_model_input(src[i], i);
+
+			if (i == 0) break;
+		}
 	}
 	else
 	{
-		qResult = res >> QLVL;
-		return qResult == 0 ? CT_MAX_VALUE - 1 : CT_MAX_VALUE - qResult;
+		for (uint16_t i = 0; i < count; ++i)
+		{
+		#if (NEUTON_BITMASK_ENABLED == 1)
+			if (is_input_used(i))
+		#endif
+				dst[i] = prepare_model_input(src[i], i);
+		}
 	}
 }
-#endif // NEUTON_Q16_SUPPORT
 
+#endif // (NEUTON_DROP_ORIGINAL_FEATURES != 1)
 
-static inline float dequantiseValue(int32_t value, NeuralNet* model)
+#if (NEUTON_PREPROCESSING_ENABLED == 1)
+
+static void extract_features()
 {
-	return (float) value / (float) (2 << (model->quantisation - 1));
+	input_t* src = (input_t*)modelInputBuffer;
+	extracted_feature_t* dst = (extracted_feature_t*)extractedFeaturesBuffer;
+
+	uint16_t windowSize = NEUTON_MODEL_WINDOW_SIZE;
+	uint16_t extractedFeaturesCount = EF_COUNT;
+
+#if (NEUTON_BITMASK_ENABLED == 1)
+	uint32_t shift = NEUTON_MODEL_INPUTS_COUNT_ORIGINAL * NEUTON_MODEL_WINDOW_SIZE;
+	uint32_t pos = 0;
+
+	#if (NEUTON_DROP_ORIGINAL_FEATURES == 1)
+		shift = 0;
+	#endif
+#endif
+
+	for (uint16_t i = 0; i < NEUTON_MODEL_INPUTS_COUNT_ORIGINAL; ++i)
+	{
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		pos = shift + i * extractedFeaturesCount;
+		InitDataBuffer(modelUsedInputsMask, pos, src, windowSize);
+	#else
+		InitDataBuffer(NULL, 0, src, windowSize);
+	#endif
+
+
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_MIN))
+	#endif
+		{
+			dst[EF_MIN] = Min();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_MAX))
+	#endif
+		{
+			dst[EF_MAX] = Max();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_MEAN))
+	#endif
+		{
+			dst[EF_MEAN] = Mean();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_RMS))
+	#endif
+		{
+			dst[EF_RMS] = RootMeanSquare();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_SIGN_CHANGES))
+	#endif
+		{
+			dst[EF_SIGN_CHANGES] = CountSignChanges();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_VARIANCE))
+	#endif
+		{
+			dst[EF_VARIANCE] = Variance();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_PFD))
+	#endif
+		{
+			dst[EF_PFD] = PetrosianFractalDimension();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_SKEWNESS))
+	#endif
+		{
+			dst[EF_SKEWNESS] = Skewness();
+		}
+	#if (NEUTON_BITMASK_ENABLED == 1)
+		if (is_input_used(pos + EF_KURTOSIS))
+	#endif
+		{
+			dst[EF_KURTOSIS] = Kurtosis();
+		}
+
+		src += windowSize;
+		dst += extractedFeaturesCount;
+	}
 }
 
-
-static inline float* RunInferenceQ8(NeuralNet* model, float* inputs)
+static coeff_t prepare_extracted_feature(extracted_feature_t value, uint16_t index)
 {
-	const uint8_t offsetTypeSize = model->weightDim <= 256 ? 1 : model->weightDim <= 65536 ? 2 : 4;
-	uint32_t offset;
+	extracted_feature_t min = extractedFeaturesScaleMin[index];
+	extracted_feature_t max = extractedFeaturesScaleMax[index];
 
-	memset(model->accumulators.raw, 0, model->neuronsCount * sizeof(*model->accumulators.u8));
+#if (NEUTON_MODEL_QLEVEL == 32)
 
-	uint32_t neuronIndex;
-	uint16_t idx;
+	coeff_t ct = value;
+	neuton_preprocessing_block_normalize(&ct, &ct, 1, min, max);
+	return ct;
 
-	for (neuronIndex = 0; neuronIndex < model->neuronsCount; neuronIndex++)
-	{
-		int32_t summ = 0;
+#else
 
-		offset = valueAt(neuronIndex, model->intLinks, offsetTypeSize);
-		for (idx = 0; idx < model->intLinksCounters[neuronIndex]; ++idx)
+	if (value < min)
+		value = min;
+	if (value > max)
+		value = max;
+
+	#if (NEUTON_INPUTS_IS_INTEGER == 1)
+
+		uint64_t tmp = value - min;
+
+		if ((max - min) == 0)
 		{
-			const int32_t firstValue  = (int32_t) model->weights.i8[offset+idx];
-			const int32_t secondValue = (int32_t) model->accumulators.u8[model->links[offset+idx]];
-			summ += firstValue * secondValue;
-		}
-
-		offset = valueAt(neuronIndex, model->extLinks, offsetTypeSize);
-		for (idx = 0; idx < model->extLinksCounters[neuronIndex]; ++idx)
-		{
-			const int32_t firstValue  = (int32_t) model->weights.i8[offset+idx];
-			const int32_t secondValue = (int32_t) ldexp(inputs[model->links[offset+idx]] > MAX_INPUT_FLOAT
-					? MAX_INPUT_FLOAT : inputs[model->links[offset+idx]], 8);
-			summ += firstValue * secondValue;
-		}
-
-		if (model->options & BIT_FORCE_INTEGER_CALCULATIONS)
-		{
-			model->accumulators.u8[neuronIndex] = accurate_fast_sigmoid_u8(
-				-(((int32_t) model->fncCoeffs.u8[neuronIndex] * summ) >> (8 + KSHIFT_2 - 1))
-			);
+			return tmp * ctMax;
 		}
 		else
 		{
-			const float qs = (float) (((int32_t) model->fncCoeffs.u8[neuronIndex] * summ)
-					>> (8 + KSHIFT_2 - 1)) / (float) (2u << 7);
-			const float tmpValue = 1.0f / (1.0f + expf(-qs));
-			model->accumulators.u8[neuronIndex] = ldexp(tmpValue > MAX_INPUT_FLOAT ? MAX_INPUT_FLOAT : tmpValue, 8);
+			return tmp * ctMax / (max - min);
 		}
 
-	}
+	#else
 
-	for (idx = 0; idx < model->outputsDim; idx++)
-		model->outputBuffer[idx] = dequantiseValue(model->accumulators.u8[model->outputLabels[idx]], model);
-
-	return model->outputBuffer;
-}
-
-
-#if (NEUTON_Q16_SUPPORT == 1)
-static inline float* RunInferenceQ16(NeuralNet* model, float* inputs)
-{
-	const uint8_t offsetTypeSize = model->weightDim <= 256 ? 1 : model->weightDim <= 65536 ? 2 : 4;
-	uint32_t offset;
-
-	memset(model->accumulators.raw, 0, model->neuronsCount * sizeof(*model->accumulators.u16));
-
-	uint32_t neuronIndex;
-	uint16_t idx;
-
-	for (neuronIndex = 0; neuronIndex < model->neuronsCount; neuronIndex++)
-	{
-		int64_t summ = 0;
-
-		offset = valueAt(neuronIndex, model->intLinks, offsetTypeSize);
-		for (idx = 0; idx < model->intLinksCounters[neuronIndex]; ++idx)
+		if ((max - min) == 0)
 		{
-			const int64_t firstValue  = (int64_t) model->weights.i16[offset+idx];
-			const int64_t secondValue = (int64_t) model->accumulators.u16[model->links[offset+idx]];
-			summ += firstValue * secondValue;
-		}
-
-		offset = valueAt(neuronIndex, model->extLinks, offsetTypeSize);
-		for (idx = 0; idx < model->extLinksCounters[neuronIndex]; ++idx)
-		{
-			const int64_t firstValue  = (int64_t) model->weights.i16[offset+idx];
-			const int64_t secondValue = (int64_t) ldexp(inputs[model->links[offset+idx]] > MAX_INPUT_FLOAT
-					? MAX_INPUT_FLOAT : inputs[model->links[offset+idx]], 16);
-			summ += firstValue * secondValue;
-		}
-
-		if (model->options & BIT_FORCE_INTEGER_CALCULATIONS)
-		{
-			model->accumulators.u16[neuronIndex] = accurate_fast_sigmoid_u16(
-				-(((int64_t) model->fncCoeffs.u16[neuronIndex] * summ) >> (16 + KSHIFT_10 - 1))
-			);
+			return (value - min) * ctMax;
 		}
 		else
 		{
-			const float qs = (float) (((int64_t) model->fncCoeffs.u16[neuronIndex] * summ)
-					>> (16 + KSHIFT_10 - 1)) / (float) (2u << 15);
-			const float tmpValue = 1.0f / (1.0f + expf(-qs));
-			model->accumulators.u16[neuronIndex] = ldexp(tmpValue > MAX_INPUT_FLOAT ? MAX_INPUT_FLOAT : tmpValue, 16);
+			return (value - min) * ctMax / (max - min);
 		}
-	}
 
-	for (idx = 0; idx < model->outputsDim; idx++)
-		model->outputBuffer[idx] = dequantiseValue(model->accumulators.u16[model->outputLabels[idx]], model);
+	#endif
 
-	return model->outputBuffer;
+#endif
 }
+
+static void prepare_extracted_features()
+{
+	extracted_feature_t* src = (extracted_feature_t*)extractedFeaturesBuffer;
+	coeff_t* dst = (coeff_t*)extractedFeaturesBuffer;
+	uint16_t count = EF_COUNT * NEUTON_MODEL_INPUTS_COUNT_ORIGINAL;
+
+#if (NEUTON_BITMASK_ENABLED == 1)
+	uint32_t shift = NEUTON_MODEL_INPUTS_COUNT_ORIGINAL * NEUTON_MODEL_WINDOW_SIZE;
+
+	#if (NEUTON_DROP_ORIGINAL_FEATURES == 1)
+		shift = 0;
+	#endif
 #endif
 
-
-#if (NEUTON_Q32_SUPPORT == 1)
-static inline float* RunInferenceF32(NeuralNet* model, float* inputs)
-{
-	const uint8_t offsetTypeSize = model->weightDim <= 256 ? 1 : model->weightDim <= 65536 ? 2 : 4;
-	uint32_t offset;
-
-	memset(model->accumulators.raw, 0, model->neuronsCount * sizeof(*model->accumulators.f32));
-
-	uint32_t neuronIndex;
-	uint16_t idx;
-	
-	for (neuronIndex = 0; neuronIndex < model->neuronsCount; neuronIndex++)
+	if (sizeof(coeff_t) > sizeof(input_t))
 	{
-		double summ = 0;
-
-		offset = valueAt(neuronIndex, model->intLinks, offsetTypeSize);
-		for (idx = 0; idx < model->intLinksCounters[neuronIndex]; ++idx)
+		for (uint16_t i = count-1; ; --i)
 		{
-			const double firstValue  = (double) model->weights.f32[offset+idx];
-			const double secondValue = (double) model->accumulators.f32[model->links[offset+idx]];
+		#if (NEUTON_BITMASK_ENABLED == 1)
+			if (is_input_used(i + shift))
+		#endif
+				dst[i] = prepare_extracted_feature(src[i], i);
+
+			if (i == 0) break;
+		}
+	}
+	else
+	{
+		for (uint16_t i = 0; i < count; ++i)
+		{
+		#if (NEUTON_BITMASK_ENABLED == 1)
+			if (is_input_used(i + shift))
+		#endif
+				dst[i] = prepare_extracted_feature(src[i], i);
+		}
+	}
+}
+
+#endif // (NEUTON_PREPROCESSING_ENABLED == 1)
+
+
+static inline coeff_t get_model_input(uint16_t index)
+{
+#if (NEUTON_PREPROCESSING_ENABLED == 0)
+
+	const uint16_t inputsCount = NEUTON_MODEL_INPUTS_COUNT;
+
+#else
+
+	const uint16_t inputsCount = NEUTON_MODEL_INPUTS_COUNT_ORIGINAL * NEUTON_MODEL_WINDOW_SIZE;
+
+#endif
+
+#if (NEUTON_DROP_ORIGINAL_FEATURES == 1)
+
+	index += inputsCount;
+
+#endif
+
+	coeff_t* coeff;
+
+
+	if (index < inputsCount)
+	{
+		coeff = (coeff_t*)modelInputBuffer;
+		return coeff[index];
+	}
+
+#if (NEUTON_PREPROCESSING_ENABLED == 1)
+
+	index -= inputsCount;
+	if (index < (EF_COUNT * NEUTON_MODEL_INPUTS_COUNT_ORIGINAL))
+	{
+		coeff = (coeff_t*)extractedFeaturesBuffer;
+		return coeff[index];
+	}
+
+#endif
+
+#if (NEUTON_MODEL_QLEVEL == 32)
+
+	return 1.0f;
+
+#else
+
+	return ctMax;
+
+#endif
+}
+
+
+int8_t neuton_model_run_inference(uint16_t *index, float **outputs)
+{
+	if (!modelIsReadyForInference)
+		return 1;
+
+#if (NEUTON_PREPROCESSING_ENABLED == 1)
+
+	extract_features();
+	prepare_extracted_features();
+
+#endif
+
+#if (NEUTON_DROP_ORIGINAL_FEATURES != 1)
+	prepare_model_inputs();
+#endif
+
+	for (neurons_size_t i = 0; i < N_ELEMENTS(modelAccumulators); ++i)
+		modelAccumulators[i] = 0;
+
+	weights_size_t weightIndex = 0;
+	for (neurons_size_t neuronIndex = 0; neuronIndex < NEUTON_MODEL_NEURONS_COUNT; ++neuronIndex)
+	{
+		acc_signed_t summ = 0;
+
+		for (; weightIndex < modelIntLinksBoundaries[neuronIndex]; ++weightIndex)
+		{
+			const acc_signed_t firstValue  = (acc_signed_t) modelWeights[weightIndex];
+			const acc_signed_t secondValue = (acc_signed_t) modelAccumulators[modelLinks[weightIndex]];
 			summ += firstValue * secondValue;
 		}
 
-		offset = valueAt(neuronIndex, model->extLinks, offsetTypeSize);
-		for (idx = 0; idx < model->extLinksCounters[neuronIndex]; ++idx)
+		for (; weightIndex < modelExtLinksBoundaries[neuronIndex]; ++weightIndex)
 		{
-			const double firstValue  = (double) model->weights.f32[offset+idx];
-			const double secondValue = (double) inputs[model->links[offset+idx]];
+			const acc_signed_t firstValue  = (acc_signed_t) modelWeights[weightIndex];
+			const acc_signed_t secondValue = (acc_signed_t) get_model_input(modelLinks[weightIndex]);
 			summ += firstValue * secondValue;
 		}
 
-		model->accumulators.f32[neuronIndex] =
-				1.0f / (1.0f + exp((double) ((double) -model->fncCoeffs.f32[neuronIndex]) * summ));
+		modelAccumulators[neuronIndex] = neuton_activation_fn(neuronIndex, summ);
 	}
 
-	for (idx = 0; idx < model->outputsDim; idx++)
-		model->outputBuffer[idx] = model->accumulators.f32[model->outputLabels[idx]];
-
-	return model->outputBuffer;
-}
-#endif
-
-
-float* NRunInference(NeuralNet* model, float* inputs)
-{
-	switch (model->quantisation)
+	for (neurons_size_t i = 0; i < N_ELEMENTS(modelOutputNeurons); ++i)
 	{
-	case 8:  return RunInferenceQ8 (model, inputs);
+#if (NEUTON_MODEL_QLEVEL == 32)
 
-#if (NEUTON_Q16_SUPPORT == 1)
-	case 16: return RunInferenceQ16(model, inputs);
-#endif
+		modelOutput[i] = modelAccumulators[modelOutputNeurons[i]];
 
-#if (NEUTON_Q32_SUPPORT == 1)
-	case 32: return RunInferenceF32(model, inputs);
-#endif
-
-	default: return NULL;
-	}
-}
-
-
-Err NOpenDataset(NFile *file, Dataset *dataset)
-{
-	if (!file || !dataset)
-		return ERR_BAD_ARGUMENT;
-
-	dataset->file = file;
-	dataset->reverseByteOrder = 0;
-
-	if (CheckFileHeader(dataset->file, &dataset->reverseByteOrder, TYPE_DATASET) != ERR_NO_ERROR)
-		return ERR_BAD_FILE_FORMAT;
-
-	const uint32_t oneElement = 1;
-	const uint32_t headerSize = sizeof(BinHeader);
-	const uint64_t metadataAddressSize;
-
-	if (NFileSeek(dataset->file, headerSize, SEEK_SET) != 0)
-		return ERR_BAD_FILE_FORMAT;
-
-	if (NFileRead(&dataset->endDataPos, sizeof(dataset->endDataPos), oneElement, dataset->file) != oneElement)
-		return ERR_READ_FILE;
-	if (dataset->reverseByteOrder)
-		Reverse4BytesValuesBuffer(&dataset->endDataPos, oneElement);
-
-	if (NFileSeek(dataset->file, dataset->endDataPos, SEEK_SET) != 0)
-		return ERR_BAD_FILE_FORMAT;
-
-	if (NFileRead(&dataset->sampleDim, sizeof(dataset->sampleDim), oneElement, dataset->file) != oneElement)
-		return ERR_READ_FILE;
-	if (dataset->reverseByteOrder)
-		Reverse4BytesValuesBuffer(&dataset->sampleDim, oneElement);
-
-	if (NFileSeek(dataset->file, headerSize + sizeof(metadataAddressSize), SEEK_SET) != 0)
-		return ERR_BAD_FILE_FORMAT;
-
-	return ERR_NO_ERROR;
-}
-
-
-Err NOpenDatasetEx(const char* datasetFilename, Dataset* dataset)
-{
-	NFile* file = NFileOpen(datasetFilename, "rb");
-	return NOpenDataset(file, dataset);
-}
-
-
-void NCloseDataset(Dataset* dataset)
-{
-	if (dataset)
-	{
-		if (dataset->file)
-			NFileClose(dataset->file);
-
-		memset(dataset, 0, sizeof(*dataset));
-	}
-}
-
-
-Err NReadDatasetSample(Dataset* dataset, float* sample, uint32_t* readSamples)
-{
-	*readSamples = 0;
-
-	int64_t currentPos = NFilePos(dataset->file);
-	if (currentPos == -1)
-		return ERR_READ_FILE;
-
-	if (currentPos < dataset->endDataPos)
-	{
-		if (NFileRead(sample, sizeof(*sample), dataset->sampleDim, dataset->file) != dataset->sampleDim)
-			return ERR_READ_FILE;
-
-		if (dataset->reverseByteOrder)
-			Reverse4BytesValuesBuffer(sample, dataset->sampleDim);
-
-		sample[dataset->sampleDim] = 1.0f;  // set the BIAS value, just in case
-		*readSamples = 1;
-	}
-
-	return ERR_NO_ERROR;
-}
-
-
-#if defined(NEUTON_MEMORY_BENCHMARK)
-static inline uint32_t NAllocCost()
-{
-	return 8;
-}
-
-
-static void insertChunk(void* ptr, uint32_t size)
-{
-	uint32_t i;
-	for (i = 0; i < NEUTON_MEMORY_BENCHMARK_SIZE; ++i)
-		if (chunks[i].ptr == NULL)
-		{
-			size += NAllocCost();
-			chunks[i].ptr = ptr;
-			chunks[i].size = size;
-			memAllocated += size;
-
-			if (++allocs > allocsMax)
-				allocsMax = allocs;
-			if (memAllocated > memAllocatedMax)
-				memAllocatedMax = memAllocated;
-
-			return;
-		}
-
-	while (1) {}
-}
-
-
-static void removeChunk(void* ptr)
-{
-	uint32_t i;
-	for (i = 0; i < NEUTON_MEMORY_BENCHMARK_SIZE; ++i)
-		if (chunks[i].ptr == ptr)
-		{
-			memAllocated -= chunks[i].size;
-			memset(&chunks[i], 0, sizeof(MemoryChunk));
-			allocs--;
-			return;
-		}
-
-	while (1) {}
-}
-#endif
-
-
-void* NAlloc(uint32_t count, uint32_t size)
-{
-	uint32_t blockSize = count * size;
-
-	if (blockSize == 0)
-		return NULL;
-
-	void* ptr = malloc(blockSize);
-	if (ptr)
-		memset(ptr, 0, blockSize);
-
-#if defined(NEUTON_MEMORY_BENCHMARK)
-	static uint8_t initialised = 0;
-	if (!initialised)
-	{
-		initialised = 1;
-		memAllocated = memAllocatedMax = 0 + _NeutonExtraMemoryUsage();
-	}
-
-	if (ptr)
-		insertChunk(ptr, blockSize);
-#endif
-
-	return ptr;
-}
-
-
-void NFree(void* ptr)
-{
-	free(ptr);
-
-#if defined(NEUTON_MEMORY_BENCHMARK)
-	removeChunk(ptr);
-#endif
-}
-
-
-uint32_t NBytesAllocated()
-{
-#if defined(NEUTON_MEMORY_BENCHMARK)
-	return memAllocated;
 #else
-	return 0;
+
+		modelOutput[i] = neuton_deqantize_value(modelAccumulators[modelOutputNeurons[i]]);
+
 #endif
-}
+
+	}
 
 
-uint32_t NBytesAllocatedTotal()
-{
-#if defined(NEUTON_MEMORY_BENCHMARK)
-	return memAllocatedMax;
+	denormalize_outputs();
+
+
+#if (NEUTON_MODEL_OUTPUTS_COUNT == 1)
+
+	if (index)
+		*index = 0;
+
 #else
-	return 0;
-#endif
-}
 
+	if (index)
+	{
+		uint16_t target = 0;
+		float max = 0.0;
+
+		for (uint16_t i = 0; i < N_ELEMENTS(modelOutput); ++i)
+			if (max < modelOutput[i])
+			{
+				max = modelOutput[i];
+				target = i;
+			}
+
+		*index = target;
+	}
+
+#endif
+
+	if (outputs)
+		*outputs = modelOutput;
+
+	return 0;
+}

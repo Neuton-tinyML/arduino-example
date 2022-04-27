@@ -32,9 +32,6 @@ Parser;
 static Parser parser = { 0 };
 
 
-void* NAlloc(uint32_t count, uint32_t size);
-
-
 uint32_t parser_buffer_size()
 {
 	return parser.bufferSize;
@@ -49,7 +46,7 @@ uint8_t parser_init(valid_packet_cb callback, uint32_t size)
 	if (parser.bufferSize < reportSize)
 		parser.bufferSize = reportSize;
 
-	parser.buffer = NAlloc(1, parser.bufferSize);
+	parser.buffer = malloc(parser.bufferSize);
 	parser.callback = callback;
 
 	return parser.buffer != NULL ? 0 : 1;

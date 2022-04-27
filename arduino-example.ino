@@ -113,8 +113,8 @@ static void channel_on_valid_packet(void* data, uint32_t)
 	{
 		PerformanceReport report;
 
-		report.ramUsage = NBytesAllocatedTotal();
-		report.ramUsageCur = NBytesAllocated();
+		report.ramUsage = neuton_model_ram_usage();
+		report.ramUsageCur = neuton_model_ram_usage();
 		report.bufferSize = parser_buffer_size();
 		report.flashUsage = app_model_size();
 		report.freq = F_CPU;

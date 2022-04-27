@@ -9,7 +9,7 @@ extern "C" {
 void timer_init();
 void timer_start();
 void timer_stop();
-uint64_t timer_value_us();
+unsigned long timer_value_us();
 
 #ifdef __cplusplus
 }

@@ -4,14 +4,10 @@
 #include <Arduino.h>
 
 
-// #define cli() asm volatile("cli"::)
-// #define sei() asm volatile("sei"::)
-
-
 typedef struct
 {
-	uint64_t start;
-	uint64_t stop;
+	unsigned long start;
+	unsigned long stop;
 }
 Timer;
 
@@ -35,7 +31,7 @@ void timer_stop()
 	timer.stop = micros();
 }
 
-uint64_t timer_value_us()
+unsigned long timer_value_us()
 {
 	return timer.stop - timer.start;
 }
